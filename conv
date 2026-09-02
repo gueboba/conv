@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+"""conv - a universal file converter.
+
+Converts images, audio, video, documents, data files and archives by
+dispatching to whatever capable tool is already on the system (ffmpeg,
+sips, textutil, pandoc, ImageMagick) and handling data and archive
+formats itself. Standard library only, single file, no configuration.
+"""
+
+from __future__ import annotations
+
+import argparse
+import bz2
+import csv
+import gzip
+import json
+import lzma
+import os
+import plistlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import traceback
+import zipfile
+from pathlib import Path
+
+VERSION = "1.0.0"
+PROG = "conv"
+IS_MAC = sys.platform == "darwin"
+
+
+class ConvError(Exception):
+    """A conversion that could not be completed, with a readable reason."""
+
+
+# --------------------------------------------------------------------------
+# Format tables
+# --------------------------------------------------------------------------
+
+AUDIO = {"mp3", "wav", "flac", "aac", "m4a", "ogg", "oga", "opus", "aiff",
+         "aif", "wma", "amr", "ac3", "caf"}
+
+VIDEO = {"mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv", "mpg",
+         "mpeg", "ts", "ogv", "3gp"}
+
+IMAGE = {"jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "heic",
+         "heif", "avif", "ico", "icns", "psd", "tga", "jp2", "pbm", "ppm",
+         "pgm", "exr", "dds", "svg", "cr2", "cr3", "nef", "arw", "dng",
+         "raf", "orf", "rw2", "pef", "srw"}
+
+DOC = {"txt", "text", "rtf", "rtfd", "html", "htm", "doc", "docx", "odt",
+       "md", "markdown", "wordml", "webarchive", "epub", "tex", "rst"}
+
+DATA = {"csv", "tsv", "json", "jsonl", "ndjson", "yaml", "yml", "plist"}
+
+# tar variants -> compression suffix understood by tarfile
+TAR_FORMATS = {"tar": "", "tgz": "gz", "tar.gz": "gz", "tbz": "bz2",
+               "tbz2": "bz2", "tar.bz2": "bz2", "txz": "xz", "tar.xz": "xz"}
+SOLO_COMPRESS = {"gz": gzip, "bz2": bz2, "xz": lzma}
+ARCHIVE = set(TAR_FORMATS) | set(SOLO_COMPRESS) | {"zip"}
+COMPOUND_EXT = ("tar.gz", "tar.bz2", "tar.xz")
+
+# `pdf` belongs to both the image and the document world; which one it is
+# depends on what sits on the other side of the conversion.
+
+SIPS_FORMAT = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "tif": "tiff",
+               "tiff": "tiff", "gif": "gif", "bmp": "bmp", "ico": "ico",
+               "icns": "icns", "psd": "psd", "jp2": "jp2", "exr": "exr",
+               "dds": "dds", "pbm": "pbm", "heic": "heic", "avif": "avif",
+               "pdf": "pdf"}
+
+TEXTUTIL = {"txt", "text", "rtf", "rtfd", "html", "htm", "doc", "docx",
+            "odt", "wordml", "webarchive"}
+TEXTUTIL_FMT = {"htm": "html", "text": "txt"}
+
+AUDIO_CODEC = {"mp3": ["-c:a", "libmp3lame"], "ogg": ["-c:a", "libvorbis"],
+               "oga": ["-c:a", "libvorbis"], "opus": ["-c:a", "libopus"],
+               "m4a": ["-c:a", "aac"], "aac": ["-c:a", "aac"]}
+
+_H264 = ["-c:v", "libx264", "-crf", "23", "-preset", "medium",
+         "-pix_fmt", "yuv420p", "-c:a", "aac"]
+VIDEO_CODEC = {"mp4": _H264 + ["-movflags", "+faststart"], "m4v": _H264,
+               "mov": _H264, "mkv": _H264,
+               "webm": ["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0",
+                        "-c:a", "libopus"]}
+
+# One pass, but with a per-clip palette: plain gif output looks awful.
+GIF_FILTER = ("fps=12,scale='min(640,iw)':-2:flags=lanczos,"
+              "split[a][b];[a]palettegen[p];[b][p]paletteuse")
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+
+def ext_of(name) -> str:
+    """Lowercase extension of a name, treating .tar.gz and friends as one."""
+    low = str(name).lower()
+    for compound in COMPOUND_EXT:
+        if low.endswith("." + compound):
+            return compound
+    base = os.path.basename(low)
+    return base.rsplit(".", 1)[-1] if "." in base else ""
+
+
+def strip_ext(path: Path) -> str:
+    name = path.name
+    ext = ext_of(name)
+    return name[: -(len(ext) + 1)] if ext else name
+
+
+def with_format(path: Path, fmt: str) -> Path:
+    return path.with_name(strip_ext(path) + "." + fmt)
+
+
+def human(nbytes: int) -> str:
+    size = float(nbytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def have(tool: str) -> bool:
+    return shutil.which(tool) is not None
+
+
+# tarfile grew extraction filters in 3.12; older versions are handled by hand.
+_FILTER_ERROR = getattr(tarfile, "FilterError", ())
+
+
+def readable(exc: Exception) -> str:
+    """Turn any backend failure into one line a person can act on."""
+    if isinstance(exc, ConvError):
+        return str(exc)
+    if _FILTER_ERROR and isinstance(exc, _FILTER_ERROR):
+        return "archive contains an unsafe path, nothing was extracted"
+    if isinstance(exc, json.JSONDecodeError):
+        return f"invalid JSON at line {exc.lineno}, column {exc.colno}"
+    if isinstance(exc, UnicodeDecodeError):
+        return "not valid UTF-8 text"
+    if isinstance(exc, OSError):
+        return exc.strerror or str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
+def first_error(stderr: bytes) -> str:
+    """The most useful line of a backend's complaint, minus its log prefix.
+
+    ffmpeg states the real cause first and then unwinds into generic
+    "Invalid argument" noise, so the first line is the one worth showing.
+    """
+    for line in stderr.decode(errors="replace").splitlines():
+        line = re.sub(r"^\[[^\]]*\]\s*", "", line).strip()
+        if line:
+            return line
+    return ""
+
+
+def run(cmd, opt, stdout=None) -> None:
+    """Run a backend, turning a non-zero exit into a ConvError."""
+    if opt.verbose:
+        print("  $ " + " ".join(shlex.quote(c) for c in cmd), file=sys.stderr)
+    proc = subprocess.run(cmd, stdout=stdout or subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise ConvError(first_error(proc.stderr) or
+                        f"{cmd[0]} exited with status {proc.returncode}")
+
+
+# --------------------------------------------------------------------------
+# Backends: images, audio, video
+# --------------------------------------------------------------------------
+
+def sips_convert(src: Path, dst: Path, opt) -> None:
+    fmt = SIPS_FORMAT[ext_of(dst.name)]
+    cmd = ["sips", "-s", "format", fmt]
+    if opt.quality is not None and fmt in ("jpeg", "heic", "jp2", "avif"):
+        cmd += ["-s", "formatOptions", str(opt.quality)]
+    run(cmd + [str(src), "--out", str(dst)], opt)
+
+
+def magick_convert(src: Path, dst: Path, opt) -> None:
+    cmd = ["magick", str(src)]
+    if opt.quality is not None:
+        cmd += ["-quality", str(opt.quality)]
+    run(cmd + [str(dst)], opt)
+
+
+def ffmpeg_convert(src: Path, dst: Path, opt) -> None:
+    sext, dext = ext_of(src.name), ext_of(dst.name)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+           "-i", str(src)]
+    if dext in AUDIO:
+        cmd += ["-vn"] + AUDIO_CODEC.get(dext, [])
+        if opt.bitrate:
+            cmd += ["-b:a", opt.bitrate]
+        elif dext == "mp3":
+            cmd += ["-q:a", "2"]
+    elif dext == "gif" and category_of(sext) == "video":
+        cmd += ["-filter_complex", GIF_FILTER]
+    elif dext in VIDEO:
+        cmd += VIDEO_CODEC.get(dext, [])
+        if opt.bitrate:
+            cmd += ["-b:v", opt.bitrate]
+    else:  # a still image, possibly the first frame of a video
+        cmd += ["-frames:v", "1"]
+        if opt.quality is not None:
+            if dext == "webp":
+                cmd += ["-quality", str(opt.quality)]
+            elif dext in ("jpg", "jpeg"):
+                # ffmpeg's -q:v runs 2 (best) to 31 (worst).
+                cmd += ["-q:v", str(round(31 - opt.quality / 100 * 29))]
+    try:
+        run(cmd + [str(dst)], opt)
+    except ConvError as exc:
+        if dext in AUDIO and "does not contain any stream" in str(exc):
+            raise ConvError("there is no audio track in this file") from None
+        raise
+
+
+def qlmanage_convert(src: Path, dst: Path, opt) -> None:
+    """Last resort for things only Quick Look can read (svg, some pdfs)."""
+    with tempfile.TemporaryDirectory() as td:
+        run(["qlmanage", "-t", "-s", "2048", "-o", td, str(src)], opt)
+        made = list(Path(td).glob("*.png"))
+        if not made:
+            raise ConvError("Quick Look could not render this file")
+        shutil.move(str(made[0]), dst)
+
+
+# --------------------------------------------------------------------------
+# Backends: documents
+# --------------------------------------------------------------------------
+
+def pandoc_convert(src: Path, dst: Path, opt) -> None:
+    run(["pandoc", str(src), "-o", str(dst)], opt)
+
+
+def textutil_to(src: Path, dst: Path, opt) -> None:
+    fmt = ext_of(dst.name)
+    fmt = TEXTUTIL_FMT.get(fmt, fmt)
+    run(["textutil", "-convert", fmt, "-output", str(dst), str(src)], opt)
+
+
+def cupsfilter_to_pdf(src: Path, dst: Path, opt) -> None:
+    with open(dst, "wb") as out:
+        run(["cupsfilter", str(src)], opt, stdout=out)
+
+
+def doc_to_pdf(src: Path, dst: Path, opt) -> None:
+    """macOS route to PDF: print through CUPS, converting first if needed."""
+    if ext_of(src.name) in ("txt", "text", "html", "htm"):
+        cupsfilter_to_pdf(src, dst, opt)
+        return
+    errors = []
+    with tempfile.TemporaryDirectory() as td:
+        for middle in ("html", "txt"):
+            mid = Path(td) / ("mid." + middle)
+            try:
+                textutil_to(src, mid, opt)
+                cupsfilter_to_pdf(mid, dst, opt)
+                return
+            except ConvError as exc:
+                errors.append(f"via {middle}: {exc}")
+    raise ConvError("; ".join(errors))
+
+
+def pdftotext_convert(src: Path, dst: Path, opt) -> None:
+    run(["pdftotext", "-layout", str(src), str(dst)], opt)
+
+
+# --------------------------------------------------------------------------
+# Backend: data formats (pure Python)
+# --------------------------------------------------------------------------
+
+def _yaml():
+    try:
+        import yaml  # noqa: PLC0415  - optional, only needed for yaml files
+    except ImportError:
+        raise ConvError("YAML support needs PyYAML (pip install pyyaml)")
+    return yaml
+
+
+def data_load(path: Path, ext: str):
+    if ext in ("csv", "tsv"):
+        delim = "\t" if ext == "tsv" else ","
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            return [dict(row) for row in csv.DictReader(fh, delimiter=delim)]
+    if ext == "json":
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    if ext in ("jsonl", "ndjson"):
+        with open(path, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+    if ext in ("yaml", "yml"):
+        with open(path, encoding="utf-8") as fh:
+            return _yaml().safe_load(fh)
+    if ext == "plist":
+        with open(path, "rb") as fh:
+            return plistlib.load(fh)
+    raise ConvError(f"cannot read .{ext} as data")
+
+
+def _rows_for_table(obj, ext: str):
+    if not isinstance(obj, list):
+        raise ConvError(f".{ext} needs a list of records; this file holds "
+                        f"{type(obj).__name__}")
+    if obj and all(isinstance(row, dict) for row in obj):
+        header: list[str] = []
+        for row in obj:
+            for key in row:
+                if key not in header:
+                    header.append(key)
+        return header, [[row.get(k, "") for k in header] for row in obj]
+    if obj and all(isinstance(row, (list, tuple)) for row in obj):
+        return None, [list(row) for row in obj]
+    if not obj:
+        return [], []
+    raise ConvError("rows must be objects or arrays, not a mix")
+
+
+def data_dump(obj, path: Path, ext: str) -> None:
+    if ext in ("csv", "tsv"):
+        header, rows = _rows_for_table(obj, ext)
+        delim = "\t" if ext == "tsv" else ","
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            # csv defaults to CRLF; plain newlines behave better in a pipe.
+            writer = csv.writer(fh, delimiter=delim, lineterminator="\n")
+            if header:
+                writer.writerow(header)
+            writer.writerows(rows)
+        return
+    if ext == "json":
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, indent=2, ensure_ascii=False, default=str)
+            fh.write("\n")
+        return
+    if ext in ("jsonl", "ndjson"):
+        if not isinstance(obj, list):
+            raise ConvError(".jsonl needs a list of records")
+        with open(path, "w", encoding="utf-8") as fh:
+            for row in obj:
+                fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        return
+    if ext in ("yaml", "yml"):
+        with open(path, "w", encoding="utf-8") as fh:
+            _yaml().safe_dump(obj, fh, sort_keys=False, allow_unicode=True)
+        return
+    if ext == "plist":
+        with open(path, "wb") as fh:
+            plistlib.dump(obj, fh)
+        return
+    raise ConvError(f"cannot write .{ext} as data")
+
+
+def data_convert(src: Path, dst: Path, opt) -> None:
+    data_dump(data_load(src, ext_of(src.name)), dst, ext_of(dst.name))
+
+
+# --------------------------------------------------------------------------
+# Backend: archives (pure Python)
+# --------------------------------------------------------------------------
+
+def safe_extract(tar: tarfile.TarFile, root: Path) -> None:
+    try:
+        tar.extractall(root, filter="data")
+    except TypeError:  # Python < 3.12 has no extraction filters
+        base = root.resolve()
+        for member in tar.getmembers():
+            target = (root / member.name).resolve()
+            if base != target and base not in target.parents:
+                raise ConvError(f"unsafe path in archive: {member.name}")
+        tar.extractall(root)
+
+
+def _copy_stream(reader, writer) -> None:
+    shutil.copyfileobj(reader, writer, length=1024 * 1024)
+
+
+def pack(root: Path, dst: Path, dext: str, opt) -> None:
+    if dext == "zip":
+        with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zf:
+            for path in sorted(root.rglob("*")):
+                if path.is_file():
+                    zf.write(path, path.relative_to(root))
+        return
+    if dext in TAR_FORMATS:
+        suffix = TAR_FORMATS[dext]
+        with tarfile.open(dst, "w:" + suffix if suffix else "w") as tf:
+            for path in sorted(root.iterdir()):
+                tf.add(path, arcname=path.name)
+        return
+    files = [p for p in root.rglob("*") if p.is_file()]
+    if len(files) != 1:
+        raise ConvError(f".{dext} holds a single file — use tar.{dext} for "
+                        f"{len(files)} files")
+    with open(files[0], "rb") as fin, SOLO_COMPRESS[dext].open(dst, "wb") as fout:
+        _copy_stream(fin, fout)
+
+
+def archive_convert(src: Path, dst: Path, opt) -> None:
+    sext, dext = ext_of(src.name), ext_of(dst.name)
+
+    # Plain file -> plain compressed file: no unpacking involved.
+    if (dext in SOLO_COMPRESS and src.is_file() and sext not in ARCHIVE):
+        with open(src, "rb") as fin, SOLO_COMPRESS[dext].open(dst, "wb") as fout:
+            _copy_stream(fin, fout)
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "root"
+        root.mkdir()
+        if src.is_dir():
+            shutil.copytree(src, root / src.name, symlinks=True)
+        elif zipfile.is_zipfile(src):
+            with zipfile.ZipFile(src) as zf:
+                zf.extractall(root)
+        elif tarfile.is_tarfile(src):
+            with tarfile.open(src) as tf:
+                safe_extract(tf, root)
+        elif sext in SOLO_COMPRESS:
+            inner = root / (strip_ext(src) or "data")
+            with SOLO_COMPRESS[sext].open(src, "rb") as fin, \
+                    open(inner, "wb") as fout:
+                _copy_stream(fin, fout)
+        elif sext not in ARCHIVE and src.is_file():
+            shutil.copy2(src, root / src.name)  # wrap a lone file up
+        else:
+            raise ConvError("not a readable archive")
+        pack(root, dst, dext, opt)
+
+
+# --------------------------------------------------------------------------
+# Routing
+# --------------------------------------------------------------------------
+
+def category_of(ext: str) -> str:
+    if ext in ARCHIVE:
+        return "archive"
+    if ext in DATA:
+        return "data"
+    if ext in AUDIO:
+        return "audio"
+    if ext in VIDEO:
+        return "video"
+    if ext == "pdf":
+        return "pdf"
+    if ext in IMAGE:
+        return "image"
+    if ext in DOC:
+        return "doc"
+    return "unknown"
+
+
+def image_backends(dext: str):
+    chain = []
+    if IS_MAC and dext in SIPS_FORMAT and have("sips"):
+        chain.append(("sips", sips_convert))
+    if have("magick"):
+        chain.append(("imagemagick", magick_convert))
+    if have("ffmpeg"):
+        chain.append(("ffmpeg", ffmpeg_convert))
+    if IS_MAC and dext == "png" and have("qlmanage"):
+        chain.append(("quicklook", qlmanage_convert))
+    if not chain:
+        raise ConvError("no image converter found — install ffmpeg or "
+                        "ImageMagick")
+    return chain
+
+
+def doc_backends(sext: str, dext: str):
+    chain = []
+    if have("pandoc") and sext != "pdf":
+        chain.append(("pandoc", pandoc_convert))
+    if IS_MAC and sext in TEXTUTIL and dext in TEXTUTIL and have("textutil"):
+        chain.append(("textutil", textutil_to))
+    if dext == "pdf" and IS_MAC and have("cupsfilter") and sext in TEXTUTIL:
+        chain.append(("cupsfilter", doc_to_pdf))
+    if sext == "pdf" and dext in ("txt", "text") and have("pdftotext"):
+        chain.append(("pdftotext", pdftotext_convert))
+    if not chain:
+        extra = " (pdf input needs poppler: brew install poppler)" \
+            if sext == "pdf" else ""
+        raise ConvError(f"no converter for .{sext} -> .{dext} — install "
+                        f"pandoc (brew install pandoc){extra}")
+    return chain
+
+
+def media_backends():
+    if not have("ffmpeg"):
+        raise ConvError("audio and video need ffmpeg (brew install ffmpeg)")
+    return [("ffmpeg", ffmpeg_convert)]
+
+
+def plan(src: Path, dext: str):
+    """Pick an ordered list of backends to try for this conversion."""
+    sext = ext_of(src.name)
+    scat, dcat = category_of(sext), category_of(dext)
+
+    if src.is_dir():
+        if dcat == "archive":
+            return [("archive", archive_convert)]
+        raise ConvError("input is a folder — only archive formats can be "
+                        "built from one")
+
+    if scat == "archive" or dcat == "archive":
+        if dcat == "archive":
+            return [("archive", archive_convert)]
+        raise ConvError(f"cannot convert an archive to .{dext} — unpack it "
+                        f"first")
+
+    if scat == "data" or dcat == "data":
+        if scat == "data" and dcat == "data":
+            return [("data", data_convert)]
+        raise ConvError(f"no route from .{sext} to .{dext}")
+
+    # A pdf is an image or a document depending on its counterpart.
+    if scat == "pdf":
+        scat = "image" if dcat == "image" else "doc"
+    if dcat == "pdf":
+        dcat = "image" if scat == "image" else "doc"
+
+    if scat in ("audio", "video") or dcat in ("audio", "video"):
+        if scat == "audio" and dcat == "video":
+            raise ConvError("cannot make a video out of an audio file")
+        if "doc" in (scat, dcat):
+            raise ConvError(f"no route from .{sext} to .{dext}")
+        return media_backends()
+
+    if scat == "image" and dcat == "image":
+        return image_backends(dext)
+    if scat == "doc" and dcat == "doc":
+        return doc_backends(sext, dext)
+
+    raise ConvError(f"no route from .{sext} to .{dext}")
+
+
+# --------------------------------------------------------------------------
+# Driving one conversion
+# --------------------------------------------------------------------------
+
+def target_path(src: Path, fmt: str, opt) -> Path:
+    if opt.output:
+        return Path(opt.output)
+    if fmt in SOLO_COMPRESS and ext_of(src.name) not in ARCHIVE:
+        # Compressing keeps the original name, the way gzip does it:
+        # notes.txt -> notes.txt.gz, so unpacking gets notes.txt back.
+        out = src.with_name(src.name + "." + fmt)
+    else:
+        out = with_format(src, fmt)
+    if opt.dir:
+        out = Path(opt.dir) / out.name
+    return out
+
+
+def convert_one(src: Path, fmt: str, opt) -> None:
+    if not src.exists():
+        raise ConvError("no such file")
+    dst = target_path(src, fmt, opt)
+    if dst.resolve() == src.resolve():
+        raise ConvError("input and output are the same file")
+
+    backends = plan(src, fmt)
+
+    if opt.dry_run:
+        clash = "" if opt.force or not dst.exists() else "  (exists, skipped)"
+        print(f"{src} -> {dst}  [{backends[0][0]}]{clash}")
+        return
+    if dst.exists() and not opt.force:
+        raise ConvError(f"{dst} already exists (use -f to overwrite)")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.parent / f".{PROG}-{os.getpid()}-{dst.name}"
+    errors = []
+    try:
+        for label, backend in backends:
+            try:
+                backend(src, tmp, opt)
+                if not tmp.exists() or tmp.stat().st_size == 0:
+                    raise ConvError(f"{label} produced no output")
+                os.replace(tmp, dst)
+                break
+            except Exception as exc:
+                if opt.verbose and not isinstance(exc, ConvError):
+                    traceback.print_exc()
+                errors.append(f"{label}: {readable(exc)}")
+                if tmp.exists():
+                    tmp.unlink()
+        else:
+            raise ConvError("; ".join(errors))
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+    before = src.stat().st_size if src.is_file() else None
+    after = dst.stat().st_size
+    sizes = f"({human(before)} -> {human(after)})" if before else f"({human(after)})"
+    print(f"{src} -> {dst}  {sizes}")
+
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+
+EXAMPLES = """\
+examples:
+  conv photo.heic jpg        one file
+  conv *.png webp            many files at once
+  conv clip.mov mp3          lift the audio out of a video
+  conv clip.mov gif          video to gif, with a per-clip palette
+  conv notes.docx pdf        document to pdf
+  conv data.csv json         data formats
+  conv site.zip tar.gz       repack an archive
+  conv shot.png jpg -q 80    80% quality instead of the default
+  conv *.tiff png -d thumbs  write the results into ./thumbs
+"""
+
+
+def print_backends() -> None:
+    rows = [
+        ("ffmpeg", have("ffmpeg"), "audio, video, webp and exotic images",
+         "brew install ffmpeg"),
+        ("sips", IS_MAC and have("sips"), "images, heic, pdf (built in)", ""),
+        ("textutil", IS_MAC and have("textutil"),
+         "txt, rtf, html, doc, docx, odt (built in)", ""),
+        ("cupsfilter", IS_MAC and have("cupsfilter"),
+         "documents to pdf (built in)", ""),
+        ("qlmanage", IS_MAC and have("qlmanage"),
+         "svg and odd formats to png (built in)", ""),
+        ("imagemagick", have("magick"), "images (optional, tried first)",
+         "brew install imagemagick"),
+        ("pandoc", have("pandoc"), "markdown, epub, latex, rst",
+         "brew install pandoc"),
+        ("pdftotext", have("pdftotext"), "pdf to text",
+         "brew install poppler"),
+    ]
+    print("backends")
+    for name, present, what, install in rows:
+        mark = "yes" if present else "no "
+        line = f"  [{mark}] {name:<12} {what}"
+        if not present and install:
+            line += f"  ({install})"
+        print(line)
+    try:
+        _yaml()
+        yaml_ok = True
+    except ConvError:
+        yaml_ok = False
+    print(f"  [{'yes' if yaml_ok else 'no '}] yaml         "
+          f".yaml and .yml data files"
+          f"{'' if yaml_ok else '  (pip install pyyaml)'}")
+    print("\nbuilt in, always available")
+    print("  data      csv, tsv, json, jsonl, plist")
+    print("  archives  zip, tar, tar.gz, tar.bz2, tar.xz, gz, bz2, xz")
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Convert files. The last argument is the format you want.",
+        epilog=EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("args", nargs="*", metavar="INPUT",
+                        help="one or more input files, then the target format")
+    parser.add_argument("-o", "--output", metavar="PATH",
+                        help="write to this exact path (single input only)")
+    parser.add_argument("-d", "--dir", metavar="DIR",
+                        help="write results into DIR instead of alongside")
+    parser.add_argument("-f", "--force", action="store_true",
+                        help="overwrite existing files")
+    parser.add_argument("-q", "--quality", type=int, metavar="N",
+                        help="image quality, 1 to 100")
+    parser.add_argument("-b", "--bitrate", metavar="RATE",
+                        help="audio or video bitrate, e.g. 192k")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="show what would happen, change nothing")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="print the commands being run")
+    parser.add_argument("--list", action="store_true",
+                        help="show which converters are installed")
+    parser.add_argument("-V", "--version", action="version",
+                        version=f"{PROG} {VERSION}")
+    opt = parser.parse_args(argv)
+
+    if opt.list:
+        print_backends()
+        return 0
+    if len(opt.args) < 2:
+        parser.print_help(sys.stderr)
+        return 2
+    if opt.quality is not None and not 1 <= opt.quality <= 100:
+        print(f"{PROG}: quality must be between 1 and 100", file=sys.stderr)
+        return 2
+
+    fmt = opt.args[-1].lstrip(".").lower()
+    inputs = [Path(a) for a in opt.args[:-1]]
+
+    if os.sep in fmt or Path(fmt).exists():
+        print(f"{PROG}: the last argument is the target format, not a path "
+              f"— try '{PROG} {inputs[0]} {ext_of(fmt) or 'jpg'}', or use -o "
+              f"to name the output", file=sys.stderr)
+        return 2
+    if opt.output and len(inputs) > 1:
+        print(f"{PROG}: -o takes a single input; use -d to send many files "
+              f"to a folder", file=sys.stderr)
+        return 2
+
+    if len(inputs) > 1:
+        claimed = {}
+        for src in inputs:
+            dst = target_path(src, fmt, opt)
+            if dst in claimed:
+                print(f"{PROG}: {claimed[dst]} and {src} would both become "
+                      f"{dst}", file=sys.stderr)
+                return 2
+            claimed[dst] = src
+
+    failures = 0
+    for src in inputs:
+        try:
+            convert_one(src, fmt, opt)
+        except Exception as exc:
+            if opt.verbose and not isinstance(exc, ConvError):
+                traceback.print_exc()
+            print(f"{PROG}: {src}: {readable(exc)}", file=sys.stderr)
+            failures += 1
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
