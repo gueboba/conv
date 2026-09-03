@@ -113,6 +113,13 @@ Python 3.8 or newer, standard library only — no pip install, ever. Everything
 else is optional, and `conv --list` will tell you what you are missing and how
 to get it.
 
+## On iPhone and iPad
+
+There is a companion app: [conv-ios](https://github.com/gueboba/conv-ios).
+Same idea, no shared code — iOS cannot shell out to ffmpeg, so it is built on
+Apple's own frameworks instead. It converts the same six categories, runs
+entirely offline, and saves results to Photos, to Files, or to a share sheet.
+
 ## Tests
 
 ```sh
