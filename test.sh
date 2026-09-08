@@ -94,6 +94,59 @@ PY
 refuses evil.tar zip
 [ -e ../escaped.txt ] && bad "hostile tar escaped the working directory"
 
+printf '\nunpacking\n'
+mkdir -p pack/deep
+echo alpha > pack/one.txt
+echo beta > pack/deep/two.txt
+"$CONV" pack zip >/dev/null 2>&1
+if "$CONV" pack.zip -x -o unpacked >/dev/null 2>&1 &&
+        cmp -s pack/one.txt unpacked/pack/one.txt &&
+        cmp -s pack/deep/two.txt unpacked/pack/deep/two.txt; then
+    ok "zip unpacks byte for byte, nesting intact"
+else
+    bad "zip did not unpack cleanly"
+fi
+"$CONV" pack tar.gz >/dev/null 2>&1
+if "$CONV" pack.tar.gz -x -o untarred >/dev/null 2>&1 &&
+        cmp -s pack/deep/two.txt untarred/pack/deep/two.txt; then
+    ok "tar.gz unpacks byte for byte"
+else
+    bad "tar.gz did not unpack cleanly"
+fi
+echo gamma > solo.txt
+"$CONV" solo.txt gz >/dev/null 2>&1
+rm -f solo.txt
+if "$CONV" solo.txt.gz -x >/dev/null 2>&1 && [ "$(cat solo.txt 2>/dev/null)" = gamma ]; then
+    ok "gz gives the single file back"
+else
+    bad "gz did not round trip through -x"
+fi
+if "$CONV" pack.zip -x -o unpacked >/dev/null 2>&1; then
+    bad "unpacking over an existing folder should need -f"
+else
+    ok "refuses to unpack over an existing folder"
+fi
+if "$CONV" pack.zip -x -o unpacked -f >/dev/null 2>&1; then
+    ok "-f unpacks over it"
+else
+    bad "-f did not overwrite"
+fi
+rm -rf dryrun
+if "$CONV" pack.zip -x -o dryrun -n >/dev/null 2>&1 && [ ! -e dryrun ]; then
+    ok "dry run unpacks nothing"
+else
+    bad "dry run wrote something"
+fi
+refuses note.txt -x
+refuses pack.zip zip -x
+python3 - <<'PY'
+import zipfile
+with zipfile.ZipFile('evil.zip', 'w') as z:
+    z.writestr('../../escaped_zip.txt', 'pwned')
+PY
+refuses evil.zip -x
+[ -e ../escaped_zip.txt ] && bad "hostile zip escaped the working directory"
+
 printf '\nimages\n'
 if has ffmpeg; then
     ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc=size=200x150 \

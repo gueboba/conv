@@ -9,9 +9,11 @@ conv report.docx pdf
 conv clip.mov gif
 conv data.csv json
 conv site.zip tar.gz
+conv site.zip -x
 ```
 
-The last argument is the format you want. That is the whole interface.
+The last argument is the format you want. That is the whole interface, and
+`-x` unpacks instead of converting.
 
 ## Why
 
@@ -75,11 +77,30 @@ Some conversions cross categories and work anyway: a video to an audio file
 (`conv clip.mov mp3`), a video to a gif, a video's first frame to a png, an
 image to a pdf and back, a folder to an archive.
 
+## Compressing and unpacking
+
+Give any file an archive format to compress it, and pass `-x` to unpack one:
+
+```sh
+conv notes.txt gz          # notes.txt -> notes.txt.gz
+conv folder zip            # a whole folder
+conv site.zip tar.gz       # repack, without unpacking by hand
+conv site.zip -x           # unpack into ./site/
+conv notes.txt.gz -x       # the single file back, the way gzip -d does it
+```
+
+`-x` reads the format from the archive itself, so it takes no target format.
+A `.zip` or `.tar` becomes a folder named after it; `.gz`, `.bz2` and `.xz`
+hold exactly one file, so they give that file straight back. `-d` and `-o`
+redirect the result, and as everywhere else nothing is overwritten without
+`-f`.
+
 ## Options
 
 ```
 -o PATH       write to this exact path (single input only)
 -d DIR        write results into DIR instead of alongside the input
+-x            unpack archives instead of converting them
 -f            overwrite existing files
 -q N          image quality, 1 to 100
 -b RATE       audio or video bitrate, e.g. 192k
@@ -105,7 +126,9 @@ other side of the conversion.
 Output is written to a temporary file next to the destination and moved into
 place only after the backend succeeds, so a failed conversion never leaves a
 half-written file behind. Archives are unpacked with path traversal checks, so
-a hostile `.tar` cannot write outside the working area.
+a hostile `.zip` or `.tar` cannot write outside the folder you unpacked it
+into — entries that climb out, or carry an absolute path, are refused and
+nothing is written.
 
 ## Requirements
 
