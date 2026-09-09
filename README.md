@@ -63,7 +63,8 @@ conv --list
 
 | Kind | Formats | Needs |
 | --- | --- | --- |
-| Images | jpg, png, gif, bmp, tiff, webp, heic, avif, ico, icns, psd, jp2, tga, exr, dds, pdf | `sips` (macOS, built in) or ffmpeg |
+| Images | jpg, png, gif, bmp, tiff, heic, avif, ico, icns, psd, jp2, tga, exr, dds, pdf | `sips` (macOS, built in) or ffmpeg |
+| Images | webp | `cwebp` (`brew install webp`) |
 | Images, read only | svg, and camera raw: cr2, cr3, nef, arw, dng, raf, orf, rw2, pef, srw | as above |
 | Audio | mp3, wav, flac, aac, m4a, ogg, opus, aiff, wma, amr, ac3, caf | ffmpeg |
 | Video | mp4, mov, mkv, avi, webm, m4v, wmv, flv, mpg, ts, ogv, 3gp | ffmpeg |
@@ -116,7 +117,8 @@ produce the same output file, `conv` stops before writing anything.
 
 Each format belongs to a category, and each pair of categories has a chain of
 backends to try in order. Images prefer `sips` on macOS, then ImageMagick, then
-ffmpeg, then Quick Look. Documents prefer pandoc, then `textutil`, then a trip
+ffmpeg, then Quick Look; webp output goes to `cwebp`, because Homebrew's ffmpeg
+stopped being built with the libwebp encoder. Documents prefer pandoc, then `textutil`, then a trip
 through CUPS for PDF output. If the first backend fails, the next one gets a
 turn; you only see an error if they all give up.
 

@@ -185,6 +185,15 @@ def sips_convert(src: Path, dst: Path, opt) -> None:
     run(cmd + [str(src), "--out", str(dst)], opt)
 
 
+def cwebp_convert(src: Path, dst: Path, opt) -> None:
+    # Homebrew's ffmpeg stopped shipping the libwebp encoder, so webp output
+    # goes through cwebp, the encoder from the webp package itself.
+    cmd = ["cwebp", "-quiet"]
+    if opt.quality is not None:
+        cmd += ["-q", str(opt.quality)]
+    run(cmd + [str(src), "-o", str(dst)], opt)
+
+
 def magick_convert(src: Path, dst: Path, opt) -> None:
     cmd = ["magick", str(src)]
     if opt.quality is not None:
@@ -513,6 +522,8 @@ def image_backends(dext: str):
         chain.append(("sips", sips_convert))
     if have("magick"):
         chain.append(("imagemagick", magick_convert))
+    if dext == "webp" and have("cwebp"):
+        chain.append(("cwebp", cwebp_convert))
     if have("ffmpeg"):
         chain.append(("ffmpeg", ffmpeg_convert))
     if IS_MAC and dext == "png" and have("qlmanage"):
@@ -724,7 +735,7 @@ examples:
 
 def print_backends() -> None:
     rows = [
-        ("ffmpeg", have("ffmpeg"), "audio, video, webp and exotic images",
+        ("ffmpeg", have("ffmpeg"), "audio, video and exotic images",
          "brew install ffmpeg"),
         ("sips", IS_MAC and have("sips"), "images, heic, pdf (built in)", ""),
         ("textutil", IS_MAC and have("textutil"),
@@ -735,6 +746,8 @@ def print_backends() -> None:
          "svg and odd formats to png (built in)", ""),
         ("imagemagick", have("magick"), "images (optional, tried first)",
          "brew install imagemagick"),
+        ("cwebp", have("cwebp"), "webp output",
+         "brew install webp"),
         ("pandoc", have("pandoc"), "markdown, epub, latex, rst",
          "brew install pandoc"),
         ("pdftotext", have("pdftotext"), "pdf to text",
